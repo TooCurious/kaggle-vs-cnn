@@ -6,12 +6,15 @@ import torch
 from torch import nn
 from torch import optim
 from torch.utils.data import DataLoader
+from torchvision.transforms.v2 import MixUp
 from tqdm import tqdm
 
 from dataloaders.batch_samplers import Upsampling
 from dataset.emotions_dataset import EmotionsDataset
 from dataset.resisc45 import Resisc45Dataset
 from models.cnn import CNN
+from models.resnet import ResNet
+from models.resnet_tricks import ResNetTricks
 from utils.common_functions import set_seed
 from utils.enums import SetType
 from utils.logger import MLFlowLogger, NeptuneLogger
@@ -28,6 +31,7 @@ class Trainer:
 
         self._prepare_data()
         self._prepare_model()
+        self._add_tricks()
 
         self._init_logger(init_logger)
 
@@ -60,6 +64,43 @@ class Trainer:
         self.validation_dataset = dataset(data_cfg, SetType.validation, transforms=validation_transforms)
         self.validation_dataloader = DataLoader(self.validation_dataset, batch_size=batch_size, shuffle=False)
 
+    def _add_tricks(self):
+        if not self.config.model.name == 'ResNetTricks':
+            return
+
+        if self.config.model.resnet_tricks.no_bias_decay:
+            no_decay, with_decay = [], []
+
+            for m in self.model.modules():
+                if isinstance(m, (nn.Linear, nn.Conv2d)):
+                    with_decay.append(m.weight)
+                    if m.bias is not None:
+                        no_decay.append(m.bias)
+                else:
+                    if hasattr(m, 'weight'):
+                        no_decay.append(m.weight)
+                    if hasattr(m, 'bias'):
+                        no_decay.append(m.bias)
+
+            params_groups = [
+                {'params': no_decay, 'weight_decay': 0.0},
+                {'params': with_decay, 'weight_decay': self.config.train.weight_decay}
+            ]
+            self.optimizer = torch.optim.SGD(params_groups, lr=self.config.train.learning_rate)
+
+        if self.config.model.resnet_tricks.scheduler:
+            training_steps = self.config.epochs_num * len(self.train_dataloader)
+            self.warmup_steps = self.config.model.resnet_tricks.warmup * training_steps
+            self.warmup_scheduler = torch.optim.lr_scheduler.LambdaLR(
+                self.optimizer, lambda step: step / self.warmup_steps
+            )
+            self.cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer, T_max=training_steps - self.warmup_steps
+            )
+
+        if self.config.model.resnet_tricks.mixup:
+            self.mixup = MixUp(num_classes=self.config.data.classes_num)
+
     def _prepare_model(self):
         """Prepares model, optimizer and loss function."""
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -77,19 +118,21 @@ class Trainer:
     def save(self, filepath: str):
         """Saves trained model."""
         os.makedirs(self.config.checkpoints_dir, exist_ok=True)
-        torch.save(
-            {
-                'model_state_dict': self.model.state_dict(),
-                'optimizer_state_dict': self.optimizer.state_dict(),
-            },
-            os.path.join(self.config.checkpoints_dir, filepath)
-        )
+        state_dicts = {'model_state_dict': self.model.state_dict(), 'optimizer_state_dict': self.optimizer.state_dict()}
+        if hasattr(self, 'warmup_scheduler') and hasattr(self, 'cosine_scheduler'):
+            state_dicts['warmup_scheduler_state_dict'] = self.warmup_scheduler.state_dict()
+            state_dicts['cosine_scheduler_state_dict'] = self.cosine_scheduler.state_dict()
+
+        torch.save(state_dicts, os.path.join(self.config.checkpoints_dir, filepath))
 
     def load(self, filepath: str):
         """Loads trained model."""
         checkpoint = torch.load(os.path.join(self.config.checkpoints_dir, filepath), map_location=self.device)
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        if hasattr(self, 'warmup_scheduler') and hasattr(self, 'cosine_scheduler'):
+            self.warmup_scheduler.load_state_dict(checkpoint['warmup_scheduler_state_dict'])
+            self.cosine_scheduler.load_state_dict(checkpoint['cosine_scheduler_state_dict'])
 
     def update_best_params(self, valid_metric: float, best_metric: float) -> float:
         """Updates best parameters: saves model if metrics exceeds the best values achieved."""
@@ -116,6 +159,9 @@ class Trainer:
         images = batch['image'].to(self.device)
         targets = batch['target'].to(self.device)
 
+        if update_model and getattr(self, 'mixup', None):
+            images, targets = self.mixup(images, targets)
+
         output = self.model(images)
         loss = self.criterion(output, targets)
 
@@ -123,6 +169,13 @@ class Trainer:
             self.optimizer.zero_grad()
             loss.backward()
             self.optimizer.step()
+
+            if self.config.model.name == 'ResNetTricks' and self.config.model.resnet_tricks.scheduler:
+                if epoch * len(self.train_dataloader) + step <= self.warmup_steps:
+                    self.warmup_scheduler.step()
+                else:
+                    self.cosine_scheduler.step()
+                self.logger.save_metrics(SetType.train.name, 'lr', self.optimizer.param_groups[0]['lr'])
 
         return loss.item(), output.detach().cpu().numpy()
 
