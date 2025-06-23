@@ -15,10 +15,10 @@ def train():
     trainer = Trainer(experiment_cfg)
 
     # One batch overfitting
-    trainer.batch_overfit()
+    # trainer.batch_overfit()
 
     # Model training
-    # trainer.fit()
+    trainer.fit()
 
 
 def predict():

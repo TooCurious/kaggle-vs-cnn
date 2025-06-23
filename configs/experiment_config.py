@@ -28,8 +28,8 @@ experiment_cfg.overfit.iterations_num = 500
 # Neptune parameters
 experiment_cfg.neptune = EasyDict()
 experiment_cfg.neptune.env_path = os.path.join(ROOT_DIR, '.env')
-experiment_cfg.neptune.project = ''
-experiment_cfg.neptune.experiment_name = ''
+experiment_cfg.neptune.project = 'CNN-research'
+experiment_cfg.neptune.experiment_name = 'test_4'
 experiment_cfg.neptune.run_id = None
 experiment_cfg.neptune.dependencies_path = os.path.join(ROOT_DIR, 'requirements.txt')
 
