@@ -39,7 +39,6 @@ class NeptuneLogger(BaseLogger):
 
     def __init__(self, config):
         super().__init__(config)
-        load_dotenv(config.env_path)
 
         self.run = neptune.init_run(
             project=config.project,
